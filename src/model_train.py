@@ -1,9 +1,11 @@
 import os
 import pandas as pd
-from sklearn.model_selection import train_test_split
-from xgboost import XGBRegressor
-from sklearn.metrics import mean_squared_error, r2_score
+import numpy as np
 import matplotlib.pyplot as plt
+import seaborn as sns
+from xgboost import XGBClassifier
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
+from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
 
 LABELLED_DIR = "data/labelled"
 
@@ -17,40 +19,85 @@ def load_and_stack_labelled_data(path=LABELLED_DIR):
             dfs.append(df)
     return pd.concat(dfs)
 
+def remove_highly_correlated_features(df, features, threshold=0.9):
+    corr_matrix = df[features].corr().abs()
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+    to_drop = [column for column in upper.columns if any(upper[column] > threshold)]
+    return [f for f in features if f not in to_drop]
+
 def main():
-    df = load_and_stack_labelled_data()
-    df = df.dropna()
-
-    # Define features
-    feature_cols = [col for col in df.columns if col not in ['Date', 'ticker', 'Close', 'forward_return']]
-
-    # Time-based split
+    df = load_and_stack_labelled_data().dropna()
     df = df.sort_values("Date")
+
+    # Binary classification target
+    df["target_class"] = (df["forward_return"] > 0).astype(int)
+
+    # Correlation filtering
+    corrs = df.corr(numeric_only=True)['forward_return'].drop('forward_return')
+    initial_features = corrs[abs(corrs) > 0.02].index.tolist()
+    selected_features = remove_highly_correlated_features(df, initial_features)
+    for col in ['target_class', 'forward_return']:
+        if col in selected_features:
+            selected_features.remove(col)
+    print("Final selected features after dropping correlated ones:", selected_features)
+
+    # Train/test split
     split_date = "2022-01-01"
     train = df[df["Date"] < split_date]
     test = df[df["Date"] >= split_date]
 
-    X_train = train[feature_cols]
-    y_train = train["forward_return"]
-    X_test = test[feature_cols]
-    y_test = test["forward_return"]
+    X_train = train[selected_features]
+    y_train = train["target_class"]
+    X_test = test[selected_features]
+    y_test = test["target_class"]
 
-    # Train model
-    model = XGBRegressor(n_estimators=100, max_depth=3, learning_rate=0.05)
-    model.fit(X_train, y_train)
+    # Hyperparameter tuning
+    param_grid = {
+        'n_estimators': [100, 200, 500],
+        'max_depth': [3, 5, 7],
+        'learning_rate': [0.01, 0.05, 0.1],
+        'subsample': [0.6, 0.8, 1.0],
+        'colsample_bytree': [0.6, 0.8, 1.0]
+    }
 
-    # Predict & evaluate
-    y_pred = model.predict(X_test)
+    model = XGBClassifier(random_state=42, eval_metric='logloss')
+    tscv = TimeSeriesSplit(n_splits=5)
 
-    print("R^2:", r2_score(y_test, y_pred))
-    print("RMSE:", mean_squared_error(y_test, y_pred, squared=False))
+    search = RandomizedSearchCV(
+        estimator=model,
+        param_distributions=param_grid,
+        n_iter=10,
+        cv=tscv,
+        scoring='accuracy',
+        verbose=1,
+        n_jobs=-1
+    )
+    search.fit(X_train, y_train)
+    print("Best hyperparameters:", search.best_params_)
 
-    # Optional: plot predictions
-    plt.scatter(y_test, y_pred, alpha=0.2)
-    plt.xlabel("Actual Return (5D)")
-    plt.ylabel("Predicted Return (5D)")
-    plt.title("Predicted vs Actual 5-Day Return")
-    plt.grid()
+    # Feature importance
+    best_model = search.best_estimator_
+    feature_importances = best_model.feature_importances_
+    top_indices = np.argsort(feature_importances)[::-1][:10]
+    top_features = [selected_features[i] for i in top_indices]
+    top_importances = feature_importances[top_indices]
+    print("Top features by importance:", top_features)
+
+    # Final model training
+    best_model.fit(X_train[top_features], y_train)
+    y_pred = best_model.predict(X_test[top_features])
+
+    # Evaluation
+    print("\nClassification Report:\n", classification_report(y_test, y_pred))
+    print("Accuracy:", accuracy_score(y_test, y_pred))
+    print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred))
+
+    # Plot Top Feature Importances
+    plt.figure(figsize=(8, 4))
+    sns.barplot(x=top_features, y=top_importances)
+    plt.xticks(rotation=45)
+    plt.title("Top Feature Importances (XGBoost Classifier)")
+    plt.tight_layout()
     plt.show()
 
 if __name__ == "__main__":
