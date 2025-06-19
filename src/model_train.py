@@ -6,6 +6,8 @@ import seaborn as sns
 from xgboost import XGBClassifier
 from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
 from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
+import yfinance as yf
+from collections import Counter
 
 LABELLED_DIR = "data/labelled"
 
@@ -25,20 +27,62 @@ def remove_highly_correlated_features(df, features, threshold=0.9):
     to_drop = [column for column in upper.columns if any(upper[column] > threshold)]
     return [f for f in features if f not in to_drop]
 
+def get_risk_free_rate(start, end):
+    """Fetches the 13-week T-Bill rate (^IRX) from Yahoo and calculates 21-day compounded RFR"""
+    rfr_df = yf.download("^IRX", start=start, end=end, auto_adjust=False)
+    if isinstance(rfr_df.index, pd.MultiIndex):
+        rfr_df.index = rfr_df.index.get_level_values(0)
+    rfr_df = rfr_df[['Close']].rename(columns={'Close': 'irx'})
+    rfr_df['daily_rfr'] = rfr_df['irx'] / 100 / 252
+    rfr_df['rfr_21d'] = (1 + rfr_df['daily_rfr']) ** 21 - 1
+    rfr_df = rfr_df[['rfr_21d']]
+    rfr_df.index = rfr_df.index.get_level_values(0)
+    return rfr_df
+
 def main():
     df = load_and_stack_labelled_data().dropna()
     df = df.sort_values("Date")
 
-    # Binary classification target
-    df["target_class"] = (df["forward_return"] > 0).astype(int)
+    # Get range for RFR download
+    start_date, end_date = df["Date"].min(), df["Date"].max()
+    rfr = get_risk_free_rate(start=start_date.strftime("%Y-%m-%d"), end=end_date.strftime("%Y-%m-%d"))
+
+    # Merge risk-free rate into the main DataFrame
+    rfr = rfr.reset_index()  
+    rfr.columns = ['Date', 'rfr_21d']  
+    df = df.merge(rfr, on="Date", how="left")
+    df = df.dropna(subset=["forward_return", "rfr_21d"])
+
+     # ----- Feature Signal Strength Diagnostic -----
+    plt.figure(figsize=(10, 4))
+    corrs = df.corr(numeric_only=True)['forward_return'].drop('forward_return')
+    corrs.sort_values(inplace=True)
+    sns.barplot(x=corrs.index, y=corrs.values)
+    plt.xticks(rotation=45)
+    plt.title("Correlation of Features with Forward Return")
+    plt.tight_layout()
+    plt.grid(True)
+    plt.show()
+
+    # Remove low-signal features based on correlation threshold
+    signal_threshold = 0.05
+    initial_features = corrs[abs(corrs) > signal_threshold].index.tolist()
+    # Classification target: outperforming risk-free rate over 21 days
+    df["target_class"] = (df["forward_return"] > df["rfr_21d"]).astype(int)
 
     # Correlation filtering
     corrs = df.corr(numeric_only=True)['forward_return'].drop('forward_return')
-    initial_features = corrs[abs(corrs) > 0.02].index.tolist()
+    signal_threshold = 0.05
+    initial_features = corrs[abs(corrs) > signal_threshold].index.tolist()
     selected_features = remove_highly_correlated_features(df, initial_features)
     for col in ['target_class', 'forward_return']:
         if col in selected_features:
             selected_features.remove(col)
+
+    # Filter out non-predictive raw price features
+    non_predictive = ['Close', 'Volume']
+    selected_features = [f for f in selected_features if f not in non_predictive]
+
     print("Final selected features after dropping correlated ones:", selected_features)
 
     # Train/test split
@@ -60,7 +104,16 @@ def main():
         'colsample_bytree': [0.6, 0.8, 1.0]
     }
 
-    model = XGBClassifier(random_state=42, eval_metric='logloss')
+    # Compute scale_pos_weight to handle class imbalance
+    class_counts = Counter(y_train)
+    scale_pos_weight = class_counts[0] / class_counts[1]
+    print(f"Class distribution: {class_counts}, scale_pos_weight={scale_pos_weight:.2f}")
+    
+    model = XGBClassifier(
+    random_state=42,
+    eval_metric='logloss',
+    scale_pos_weight=scale_pos_weight
+)
     tscv = TimeSeriesSplit(n_splits=5)
 
     search = RandomizedSearchCV(
